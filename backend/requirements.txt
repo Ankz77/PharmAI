@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+motor
+pymongo
+scikit-learn
+xgboost
+numpy
+pandas
