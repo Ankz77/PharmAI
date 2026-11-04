@@ -1,4 +1,3 @@
-# backend/main.py
 from clinical_rules import evaluate_emergency_triage, screen_pregnancy_and_contraindications, evaluate_age_group
 import os
 import joblib
