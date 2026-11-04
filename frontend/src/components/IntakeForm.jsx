@@ -78,7 +78,7 @@ export default function IntakeForm({ onSubmit, loading }) {
     };
 
     return (
-        <form onSubmit={handleSubmit} className="bg-white p-8 rounded-xl shadow-lg border border-slate-200 space-y-6">
+        <form onSubmit={handleSubmit} className="bg-white p-4 sm:p-6 lg:p-8 rounded-xl shadow-lg border border-slate-200 space-y-6">
             <div className="border-b border-slate-200 pb-4">
                 <h2 className="text-2xl font-extrabold text-blue-900 tracking-tight">Patient Clinical Intake</h2>
                 <p className="text-xs text-slate-500 mt-1">Enter patient vitals and select presenting symptoms for evaluation.</p>
@@ -178,6 +178,7 @@ export default function IntakeForm({ onSubmit, loading }) {
                         </option>
                         {Array.isArray(availableSymptoms) && availableSymptoms
                             .filter(s => !formData.symptoms.includes(s))
+                            .sort((a, b) => formatSymptomName(a).localeCompare(formatSymptomName(b), undefined, { sensitivity: 'base' }))
                             .map((symptom) => (
                                 <option key={symptom} value={symptom}>
                                     {formatSymptomName(symptom)}

@@ -15,13 +15,18 @@ class PatientIntake(BaseModel):
 
 class DiseasePredictionMatch(BaseModel):
     predicted_disease: str
-    confidence_score: float
+    model_score: Optional[float] = None
+    matched_symptoms: List[str] = Field(default_factory=list)
     description: str
     precautions: List[str]
-    recommended_medicine: str
-    dosage_instruction: str
-    physical_unit_breakdown: str
-    pregnancy_warnings: List[str]
+    recommended_medicine: Optional[str] = None
+    dosage_instruction: Optional[str] = None
+    medication_source: Optional[str] = None
+    medication_reviewed_by: Optional[str] = None
+    medication_reviewed_at: Optional[str] = None
+    medication_category: Optional[str] = None
+    common_medications_reference: Optional[str] = None
+    pregnancy_warnings: List[str] = Field(default_factory=list)
 
 class ClinicalResponse(BaseModel):
     top_predictions: List[DiseasePredictionMatch]
