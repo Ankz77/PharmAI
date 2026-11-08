@@ -1,11 +1,18 @@
 from clinical_rules import evaluate_emergency_triage, screen_pregnancy_and_contraindications, evaluate_age_group
 import os
+import re
 import joblib
 import numpy as np
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from bson import ObjectId
+from bson.errors import InvalidId
+from pymongo.errors import DuplicateKeyError
 from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+from auth import create_access_token, decode_access_token, hash_password, verify_password
 from csv_loader import (
     load_disease_medication_references,
     load_disease_metadata,
@@ -14,7 +21,14 @@ from csv_loader import (
 from medication_safety import has_medical_review
 from symptom_matching import normalize_symptom, explain_symptom_matches
 
-from models import PatientIntake, ClinicalResponse, DiseasePredictionMatch
+from models import (
+    ClinicalResponse,
+    DiseasePredictionMatch,
+    LoginRequest,
+    PatientIntake,
+    ProfileUpdateRequest,
+    RegisterRequest,
+)
 
 app = FastAPI(title="PharmAI Clinical Decision Support API", version="1.0")
 
@@ -33,6 +47,8 @@ app.add_middleware(
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = "pharm_ai_db"
+AUTH_SECRET_KEY = os.getenv("AUTH_SECRET_KEY")
+bearer_scheme = HTTPBearer(auto_error=False)
 
 client = None
 db = None
@@ -47,8 +63,12 @@ feature_columns = None
 async def startup_event():
     global client, db, disease_metadata, disease_patterns, medication_references
     global model, label_encoder, feature_columns
+    if not AUTH_SECRET_KEY or len(AUTH_SECRET_KEY) < 32:
+        raise RuntimeError("Set AUTH_SECRET_KEY to a random value of at least 32 characters.")
+
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
+    await db.users.create_index("email", unique=True)
 
     model_dir = os.path.join(os.path.dirname(__file__), "trained_models")
     model = joblib.load(os.path.join(model_dir, "xgb_disease_model.joblib"))
@@ -62,10 +82,115 @@ async def startup_event():
     
 @app.on_event("shutdown")
 async def shutdown_event():
-    client.close()
+    if client:
+        client.close()
+
+
+def public_user(user):
+    return {
+        "id": str(user["_id"]),
+        "name": user["name"],
+        "email": user["email"],
+        "profession": user["profession"],
+    }
+
+
+def auth_response(user):
+    return {
+        "access_token": create_access_token(user, AUTH_SECRET_KEY),
+        "token_type": "bearer",
+        "user": public_user(user),
+    }
+
+
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+):
+    if not credentials or not AUTH_SECRET_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Please sign in to continue.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token_data = decode_access_token(credentials.credentials, AUTH_SECRET_KEY)
+    if not token_data:
+        raise HTTPException(
+            status_code=401,
+            detail="Your session is invalid or has expired. Please sign in again.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        user_id = ObjectId(token_data["sub"])
+    except InvalidId:
+        user_id = None
+    user = await db.users.find_one({"_id": user_id}) if user_id else None
+    if not user:
+        raise HTTPException(status_code=401, detail="Account not found. Please sign in again.")
+    return user
+
+
+@app.post("/auth/register")
+async def register(request: RegisterRequest):
+    email = request.email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    name = request.name.strip()
+    if len(name) < 2:
+        raise HTTPException(status_code=422, detail="Enter your full name.")
+
+    user = {
+        "name": name,
+        "email": email,
+        "profession": request.profession,
+        "password_hash": hash_password(request.password),
+        "created_at": datetime.utcnow(),
+    }
+    try:
+        await db.users.insert_one(user)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="An account with this email already exists.")
+    return auth_response(user)
+
+
+@app.post("/auth/login")
+async def login(request: LoginRequest):
+    email = request.email.strip().lower()
+    user = await db.users.find_one({"email": email})
+    if not user or not verify_password(request.password, user.get("password_hash")):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return auth_response(user)
+
+
+@app.get("/auth/me")
+async def get_account(current_user=Depends(get_current_user)):
+    return {"user": public_user(current_user)}
+
+
+@app.patch("/auth/me")
+async def update_account(
+    request: ProfileUpdateRequest,
+    current_user=Depends(get_current_user),
+):
+    name = request.name.strip()
+    if len(name) < 2:
+        raise HTTPException(status_code=422, detail="Enter your full name.")
+
+    await db.users.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {"name": name, "profession": request.profession, "updated_at": datetime.utcnow()}},
+    )
+    updated_user = await db.users.find_one({"_id": current_user["_id"]})
+    if not updated_user:
+        raise HTTPException(status_code=404, detail="Account not found.")
+    return {"user": public_user(updated_user)}
+
 
 @app.post("/predict", response_model=ClinicalResponse)
-async def predict_disease(intake: PatientIntake):
+async def predict_disease(intake: PatientIntake, current_user=Depends(get_current_user)):
     triage = evaluate_emergency_triage(intake.temperature, intake.symptoms)
     if triage["is_emergency"]:
         emergency_match = DiseasePredictionMatch(
@@ -167,6 +292,7 @@ async def predict_disease(intake: PatientIntake):
     
     log_document = {
         "timestamp": datetime.utcnow(),
+        "user_id": str(current_user["_id"]),
         "intake": intake.dict(),
         "top_predictions": [p.dict() for p in top_predictions]
     }
@@ -178,7 +304,12 @@ async def predict_disease(intake: PatientIntake):
     )
 
 @app.get("/treatment-summary")
-async def get_treatment_summary(disease: str = Query(...), weight_kg: float = Query(70.0), age: int = Query(25)):
+async def get_treatment_summary(
+    disease: str = Query(...),
+    weight_kg: float = Query(70.0),
+    age: int = Query(25),
+    current_user=Depends(get_current_user),
+):
     medicine_record = await db.medicines.find_one({"disease": disease})
     if not has_medical_review(medicine_record):
         raise HTTPException(
@@ -209,7 +340,7 @@ async def get_treatment_summary(disease: str = Query(...), weight_kg: float = Qu
     }
 
 @app.get("/symptoms/all")
-async def get_all_symptoms():
+async def get_all_symptoms(current_user=Depends(get_current_user)):
     symptoms = {
         symptom
         for patterns in disease_patterns.values()
@@ -219,6 +350,11 @@ async def get_all_symptoms():
     return {"symptoms": sorted(symptoms)}
 
 @app.get("/history")
-async def get_prediction_history(limit: int = 10):
-    logs = await db.prediction_logs.find({}, {"_id": 0}).sort("timestamp", -1).limit(limit).to_list(length=limit)
+async def get_prediction_history(
+    limit: int = Query(10, ge=1, le=100),
+    current_user=Depends(get_current_user),
+):
+    logs = await db.prediction_logs.find(
+        {"user_id": str(current_user["_id"])}, {"_id": 0, "user_id": 0}
+    ).sort("timestamp", -1).limit(limit).to_list(length=limit)
     return {"history": logs}

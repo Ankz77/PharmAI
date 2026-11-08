@@ -1,6 +1,24 @@
 # backend/models.py
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Literal, Optional
+
+
+class RegisterRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    email: str = Field(..., min_length=5, max_length=254)
+    password: str = Field(..., min_length=12, max_length=128)
+    profession: Literal["Doctor", "Nurse", "Health worker"]
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=5, max_length=254)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class ProfileUpdateRequest(BaseModel):
+    name: str = Field(..., min_length=2, max_length=100)
+    profession: Literal["Doctor", "Nurse", "Health worker"]
+
 
 class PatientIntake(BaseModel):
     age: int = Field(..., ge=0, le=120)
